@@ -1,0 +1,17 @@
+[package]
+name = "te"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+docx-rs = { git = "https://github.com/koakuma-chan/docx-rs", version = "0.4.18-rc19", default-features = false }
+infer = "0.19"
+lopdf = { version = "0.36", default-features = false }
+mimalloc = "0.1"
+scheduler = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"

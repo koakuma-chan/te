@@ -41,9 +41,9 @@ fn extract_pdf(input: &[u8]) -> Result<String, String> {
             //
             .stdin(Stdio::null())
             //
-            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             //
-            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
             //
             .output()
             //

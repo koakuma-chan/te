@@ -5,65 +5,9 @@ const MAX_TEXT_LEN: usize = 32_768;
 fn extract_pdf(input: &[u8]) -> Result<String, String> {
     use lopdf::{Document, Object};
 
-    fn extract_ocr(buf: &mut String, input: &[u8]) -> Result<(), String> {
-        use std::{
-            io::Write,
-            process::{Command, Stdio},
-        };
+    use tesseract_plumbing::TessBaseApi;
 
-        use tempfile::NamedTempFile;
-
-        if input.is_empty() {
-            return Ok(());
-        }
-
-        let Some(kind) = infer::get(input) else {
-            return Ok(());
-        };
-        match kind.mime_type() {
-            "image/png" | "image/jpeg" | "image/tiff" | "image/gif" | "image/webp" => (),
-
-            _ => return Ok(()),
-        }
-
-        let mut file = NamedTempFile::with_suffix(&format!(".{}", kind.extension()))
-            //
-            .map_err(|e| format!("failed to create a temporary file: {e:?}"))?;
-        file.write_all(input)
-            //
-            .map_err(|e| format!("failed to write image data to file: {e:?}"))?;
-
-        let output = Command::new("tesseract")
-            //
-            .arg(file.path())
-            //
-            .arg("stdout")
-            //
-            .stdin(Stdio::null())
-            //
-            .stdout(Stdio::piped())
-            //
-            .stderr(Stdio::piped())
-            //
-            .output()
-            //
-            .map_err(|e| format!("failed to run ocr: {e:?}"))?;
-
-        if output.status.success() {
-            for chunk in output.stdout.utf8_chunks() {
-                buf.push_str(chunk.valid());
-                if buf.len() > MAX_TEXT_LEN {
-                    return Err(format!("invalid text length: {}", buf.len()));
-                }
-            }
-
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            Err(format!("ocr failed: {stderr}"))
-        }
-    }
+    use leptonica_plumbing::Pix;
 
     let document = Document::load_mem(input)
         //
@@ -87,13 +31,62 @@ fn extract_pdf(input: &[u8]) -> Result<String, String> {
     if effective_len < MIN_TEXT_LEN {
         buf.clear();
 
+        let mut tesseract = TessBaseApi::create();
+        if let Err(e) = tesseract.init_4(
+            //
+            Some(c"/usr/share/tesseract-ocr/5/tessdata"),
+            //
+            Some(c"eng"),
+            //
+            tesseract_sys::TessOcrEngineMode_OEM_LSTM_ONLY,
+        ) {
+            return Err(format!("failed to initialize ocr: {e:?}"));
+        }
+
         for (object_id, _) in document.objects.iter() {
             if let Ok(object) = document.get_object(*object_id) {
                 if let Object::Stream(stream) = object {
                     if let Ok(subtype) = stream.dict.get(b"Subtype") {
                         if let Object::Name(name) = subtype {
                             if name == b"Image" {
-                                extract_ocr(&mut buf, &stream.content)?;
+                                let data = &stream.content;
+                                if data.is_empty() {
+                                    continue;
+                                }
+
+                                let pix = match Pix::read_mem(&data) {
+                                    Ok(pix) => pix,
+
+                                    Err(_) => {
+                                        eprintln!("failed to read image data");
+
+                                        continue;
+                                    }
+                                };
+
+                                tesseract.set_image_2(&pix);
+
+                                match tesseract.get_utf8_text() {
+                                    Ok(text) => match text.as_ref().to_str() {
+                                        Ok(text_str) => {
+                                            buf.push_str(text_str);
+                                            if buf.len() > MAX_TEXT_LEN {
+                                                return Err(format!(
+                                                    "invalid text length: {}",
+                                                    buf.len()
+                                                ));
+                                            }
+
+                                            buf.push('\n');
+                                        }
+                                        Err(e) => {
+                                            eprintln!("failed to extract text: {e:?}");
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("failed to extract text: {e:?}");
+                                    }
+                                }
                             }
                         }
                     }
@@ -116,36 +109,28 @@ fn extract_docx(input: &[u8]) -> Result<String, String> {
     };
 
     fn extract_paragraph(buf: &mut String, paragraph: &[ParagraphChild]) -> Result<(), String> {
-        buf.push('\n');
-
-        let mut stack = Vec::<std::slice::Iter<'_, ParagraphChild>>::new();
-
-        stack.push(paragraph.iter());
-
-        while let Some(iter) = stack.last_mut() {
-            if let Some(child) = iter.next() {
-                if let ParagraphChild::Run(run) = child {
-                    for child in &run.children {
-                        match child {
-                            RunChild::Text(text) => {
-                                buf.push_str(&text.text);
-                                if buf.len() > MAX_TEXT_LEN {
-                                    return Err(format!("invalid text length: {}", buf.len()));
-                                }
+        for child in paragraph {
+            if let ParagraphChild::Run(run) = child {
+                for child in &run.children {
+                    match child {
+                        RunChild::Text(text) => {
+                            buf.push_str(&text.text);
+                            if buf.len() > MAX_TEXT_LEN {
+                                return Err(format!("invalid text length: {}", buf.len()));
                             }
-
-                            RunChild::Break(_) => buf.push('\n'),
-
-                            RunChild::Tab(_) => buf.push('\t'),
-
-                            _ => (),
                         }
+
+                        RunChild::Break(_) => buf.push('\n'),
+
+                        RunChild::Tab(_) => buf.push('\t'),
+
+                        _ => (),
                     }
                 }
-            } else {
-                stack.pop();
             }
         }
+
+        buf.push('\n');
 
         Ok(())
     }
@@ -200,7 +185,7 @@ fn set_self_batch() {
 
 fn dispatch(input: &[u8]) -> Result<String, String> {
     if input.len() < 256 || input.len() > 5 * 1024 * 1024 {
-        return Err("invalid input length".to_string());
+        return Err(format!("invalid input length: {} bytes", input.len()));
     }
 
     set_self_batch();
